@@ -262,6 +262,40 @@ class Intervention:
             ranked.sort(key=lambda z: 0 if z["feature"] == focus else 1)
         return ranked[:top_k]
 
+    def counterfactual_combo(self, row_id: int, focus: str | None = None) -> dict | None:
+        """贪心两步组合干预：先取单特征最优，再在其基础上找第二步最优。"""
+        singles = self.counterfactual(row_id, top_k=4, focus=focus)
+        if not singles:
+            return None
+        x0 = self.d.X[row_id:row_id + 1].copy()
+        base = float(self.m.p_dropout(x0)[0])
+        first = singles[0]
+        j1 = self.d.feature_names.index(first["feature"])
+        x1 = x0.copy(); x1[0, j1] = first["to"]
+        p1 = float(self.m.p_dropout(x1)[0])
+        best2 = None
+        for key in INTERVENABLE:
+            if key == first["feature"] or key not in self.d.feature_names:
+                continue
+            j = self.d.feature_names.index(key)
+            lo, hi = self.d.bounds[key]
+            step = PERTURB.get(key, 1)
+            nv = min(hi, max(lo, x1[0, j] + step))
+            if abs(nv - x1[0, j]) < 1e-9:
+                continue
+            x2 = x1.copy(); x2[0, j] = nv
+            p2 = float(self.m.p_dropout(x2)[0])
+            cand = {"feature": key, "from": round(float(x1[0, j]), 3),
+                    "to": round(float(nv), 3), "p_before": round(p1, 4),
+                    "p_after": round(p2, 4), "delta": round(p2 - p1, 4),
+                    "lever": LEVER.get(key, "student")}
+            if best2 is None or cand["p_after"] < best2["p_after"]:
+                best2 = cand
+        moves = [first] + ([best2] if best2 else [])
+        after = best2["p_after"] if best2 else round(p1, 4)
+        return {"moves": moves, "p_before": round(base, 4), "p_after": after,
+                "delta": round(after - base, 4)}
+
     def cohort_backtest(self, row_id: int, feature: str,
                         model_delta: float | None = None) -> dict:
         """同一专业内的真实子群对照，并给出两比例检验。
@@ -490,6 +524,12 @@ class LearnPolicyAgent:
         inst_cfs = [c for c in cfs if c.get("lever") == "institution"]
         back = self.iv.cohort_backtest(row_id, best["feature"],
                                        model_delta=best["delta"]) if best else {}
+        # A3：候选特征被扫描过多次，单个 p 值需做 Bonferroni 校正
+        m_tests = max(1, len(cfs))
+        if back.get("p_one_sided") is not None:
+            back["n_tests"] = m_tests
+            back["p_adjusted"] = round(min(1.0, back["p_one_sided"] * m_tests), 4)
+        combo = self.iv.counterfactual_combo(row_id, focus=focus) if best else None
         p0 = float(self.m.p_dropout(self.d.X[row_id:row_id + 1])[0])
         rec, verdict = self._recommend(best, back)
         # 知识库检索：把"哪个特征异常"映射为可执行措施，并标注证据等级
@@ -498,23 +538,39 @@ class LearnPolicyAgent:
         if kb_best and verdict in ("advise", "weak"):
             rec = rec + [f"措施库：{kb_best['name']}（{LEVEL_LABEL[kb_best['evidence']]}；责任方：{kb_best['owner']}）"
                          f"——{kb_best['action']}"]
+        # 解释生成：只读结构化证据，不改任何决策字段
+        _risk = "高" if p0 >= 0.6 else "中" if p0 >= 0.3 else "低"
+        _ev = {"p_dropout": round(p0, 4), "risk_level": _risk,
+               "top_feature": best["feature"] if best else None,
+               "delta": best.get("delta") if best else None,
+               "cohort_n": (back.get("same_level_cohort") or {}).get("n"),
+               "cohort_rate": (back.get("same_level_cohort") or {}).get("actual_dropout_rate"),
+               "verdict": verdict}
+        try:
+            from llm import generate as _llm_gen
+            _llm = _llm_gen(_ev)
+        except Exception as _exc:  # noqa: BLE001
+            _llm = {"source": "template", "text": "", "latency_ms": 0.0,
+                    "error": type(_exc).__name__}
         return {
             "query": {"row_id": row_id, "question": question or PROMPTS[0]},
             "student": {"course": self.d.rows[row_id][GROUP],
                         "actual_target": self.d.rows[row_id][TARGET],
                         "p_dropout": round(p0, 4),
-                        "risk_level": "高" if p0 >= 0.6 else "中" if p0 >= 0.3 else "低"},
+                        "risk_level": _risk},
             "model_evidence": {"auc_macro_ovr":
                                self.metrics["auc_macro_ovr_calibrated"],
                                "brier_dropout": self.metrics["brier_dropout"],
                                "top_signals": self._attribution(row_id)},
             "counterfactual_top": best,
+            "counterfactual_combo": combo,
             "counterfactual_all": cfs,
             "institutional_alternative": inst_cfs[0] if inst_cfs else None,
             "cohort_backtest": back,
             "recommendation": rec, "recommendation_verdict": verdict,
             "knowledge_base": {"selected": kb_best, "entries": kb_hits,
                                "summary": kb_summary()},
+            "llm": _llm,
             "trace": trace, "memory": memory,
             "planning": {"steps": len(trace), "actions": done, "mode": mode,
                          "policy": "DecisionTree trained on auto-generated labels"
@@ -555,7 +611,7 @@ class LearnPolicyAgent:
             return ["当前样本无可干预特征，建议人工复核"], "manual_review"
         a = back.get("same_level_cohort", {}).get("actual_dropout_rate")
         b = back.get("higher_level_cohort", {}).get("actual_dropout_rate")
-        p = back.get("p_value")
+        p = back.get("p_adjusted", back.get("p_value"))
         direction = back.get("direction")
         lever = best.get("lever", "student")
         lever_txt = "学生/辅导员可改" if lever == "student" else "机构决策（需院系或资助部门配合）"
@@ -575,12 +631,13 @@ class LearnPolicyAgent:
                     "manual_review")
         if p is not None and p > 0.10:
             return ([head,
-                     f"方向一致但差异不显著（同水平 {a} vs 更高水平 {b}，单侧 p={p}）",
+                     f"方向一致但差异不显著（同水平 {a} vs 更高水平 {b}，"
+                     f"单侧 p={back.get('p_one_sided')}，Bonferroni 校正后 p={p}）",
                      "列为候选线索，不作为干预优先级；建议补充样本或由辅导员结合个案判断"],
                     "weak")
         return ([head,
                  f"真实队列佐证：同水平组辍学率 {a}，更高水平组 {b}"
-                 f"（单侧 p={p}，同专业内对照）",
+                 f"（单侧 p={back.get('p_one_sided')}，校正后 p={p}，同专业内对照）",
                  "建议由学业辅导员结合实际情况确认后执行；本结论为决策辅助，不作处分依据"],
                 "advise")
 

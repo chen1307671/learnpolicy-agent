@@ -7,13 +7,20 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-ACCOUNT = "judge"
-PASSWORD = "learn2026"
+ACCOUNT = os.environ.get("AGENT_ACCOUNT", "judge")
+PASSWORD = os.environ.get("AGENT_PASSWORD", "learn2026")
 MAX_BODY = 1 << 20
-SESSIONS: set[str] = set()
+SESSION_TTL = float(os.environ.get("SESSION_TTL", "28800"))      # 8 小时
+LOGIN_LIMIT, LOGIN_WINDOW = 10, 60                                # 每分钟 10 次
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "").lower() in ("1", "true")
+SESSIONS: dict[str, float] = {}                                   # sid -> 过期时间
+LOGIN_HITS: dict[str, list[float]] = {}                           # ip -> 时间戳
+RESULT_CACHE: dict[tuple, dict] = {}                              # (row_id, question) -> 结果
+CACHE_MAX = 200
 STATE: dict = {}
 STATE["ready"] = False
 
@@ -77,15 +84,18 @@ async function ask(){const q=document.getElementById('q').value,rid=parseInt(doc
  const steps=r.trace.map(t=>`<div class="ev"><b>${t.step}. ${esc(t.action)}</b> <span style="color:#8b97a8">(${esc(t.action_source)})</span><br>${esc(t.observation)}</div>`).join('');
  const a=bt.same_level_cohort,b=bt.higher_level_cohort;
  document.getElementById('out').innerHTML=`
- <div class="card"><div class="kv"><span>风险：${esc(s.risk_level)}</span><span>P(Dropout) ${s.p_dropout}</span>
+ <div class="card"><div class="kv"><span>风险：${esc(s.risk_level)}</span><span>${({advise:'判定：建议',weak:'判定：线索',manual_review:'判定：待复核',insufficient:'判定：证据不足'})[r.recommendation_verdict]||('判定：'+r.recommendation_verdict)}</span><span>P(Dropout) ${s.p_dropout}</span>
  <span>实际结果 ${esc(s.actual_target)}</span><span>规划 ${r.planning.steps} 步</span><span>模型 AUC ${r.model_evidence.auc_macro_ovr}</span></div>
  <div class="sec">优先干预（模型反事实推演）</div>
  <div>${cf?`${esc(cf.feature)}：${cf.from} → ${cf.to}，P(Dropout) ${cf.p_before} → ${cf.p_after}（Δ ${cf.delta}）`:'无可用干预'}</div>
+ ${r.counterfactual_combo&&r.counterfactual_combo.moves?`<div style="margin-top:6px;color:#4a5568">组合两步：${r.counterfactual_combo.moves.map(m=>esc(m.feature)+' '+m.from+'→'+m.to).join('；')}，P ${r.counterfactual_combo.p_before} → ${r.counterfactual_combo.p_after}（Δ ${r.counterfactual_combo.delta}）</div>`:''}
  <div class="sec">真实队列回测佐证</div>
  <div>${esc(bt.feature||'')}：同水平组 n=${a?a.n:0} 实际辍学率 ${a?a.actual_dropout_rate:'-'}；更高水平组 n=${b?b.n:0} 实际辍学率 ${b?b.actual_dropout_rate:'-'}</div></div>
  <div class="card"><div class="sec">模型归因（Top 5）</div><table><tr><th>特征</th><th>贡献</th></tr>${sig}</table>
  <div class="sec">自适应规划轨迹（工具选择由策略模型产生）</div>${steps}
  <div class="sec">复核建议</div><ul>${r.recommendation.map(x=>'<li>'+esc(x)+'</li>').join('')}</ul>
+ ${r.llm&&r.llm.text?`<div class="sec">解释生成（${esc(r.llm.source)}${r.llm.latency_ms?` · ${r.llm.latency_ms}ms`:''}）</div>
+ <div class="ev">${esc(r.llm.text)}</div>`:''}
  ${r.knowledge_base&&r.knowledge_base.selected?`<div class="sec">措施库（${esc(r.knowledge_base.summary.total)} 条，命中 ${r.knowledge_base.entries.length} 条）</div>
  <ul>${r.knowledge_base.entries.map(e=>'<li>【'+esc(e.evidence)+'级】<b>'+esc(e.name)+'</b>（'+esc(e.owner)+'）：'+esc(e.action)+'</li>').join('')}</ul>`:''}</div>
  <div class="card"><details><summary>展开完整 JSON</summary><pre>${esc(JSON.stringify(r,null,1))}</pre></details></div>`;}
@@ -106,6 +116,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(b)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+                         "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+                         "connect-src 'self'; frame-ancestors 'none'")
         for k, v in (extra or []):
             self.send_header(k, v)
         self.end_headers()
@@ -123,7 +140,37 @@ class Handler(BaseHTTPRequestHandler):
 
     def _authed(self):
         s = self._sid()
-        return bool(s and s in SESSIONS)
+        if not s:
+            return False
+        exp = SESSIONS.get(s)
+        now = time.time()
+        if exp is None:
+            return False
+        if exp < now:
+            SESSIONS.pop(s, None)
+            return False
+        # 滑动续期，避免长时间使用时被踢
+        SESSIONS[s] = now + SESSION_TTL
+        return True
+
+    def _client_ip(self) -> str:
+        return (self.headers.get("X-Forwarded-For", "") or
+                self.client_address[0] or "unknown").split(",")[0].strip()
+
+    def _login_limited(self) -> bool:
+        now = time.time()
+        hits = [t for t in LOGIN_HITS.get(self._client_ip(), []) if now - t < LOGIN_WINDOW]
+        hits.append(now)
+        LOGIN_HITS[self._client_ip()] = hits
+        return len(hits) > LOGIN_LIMIT
+
+    def do_HEAD(self):
+        """探活只需要状态码与头，不返回 body。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
 
     def do_GET(self):
         path = urlparse(self.path).path
@@ -137,8 +184,9 @@ class Handler(BaseHTTPRequestHandler):
             if (q.get("demo") and os.environ.get("DEMO_LOCAL") == "1"
                     and self.client_address[0] in ("127.0.0.1", "::1")):
                 sid = secrets.token_hex(16)
-                SESSIONS.add(sid)
-                return self._send(302, "", extra=[("Location", "/?auto=1"),
+                SESSIONS[sid] = time.time() + SESSION_TTL
+                target = "/?auto=1" if q.get("auto") else "/"
+                return self._send(302, "", extra=[("Location", target),
                                                   ("Set-Cookie", f"sid={sid}; Path=/; HttpOnly")])
             return self._send(200, APP_HTML if self._authed() else LOGIN_HTML)
         if not self._authed():
@@ -152,6 +200,35 @@ class Handler(BaseHTTPRequestHandler):
                          "target": d.rows[i]["Target"]}
                         for i in list(d.test_idx[:12])]
             return self._json({"prompts": STATE["prompts"], "students": students})
+        if path == "/api/batch":
+            if not self._authed():
+                return self._json({"error": "unauthorized"}, 401)
+            if not STATE.get("ready"):
+                return self._json({"status": "loading"}, 503)
+            import numpy as _np
+            n = 20
+            try:
+                from urllib.parse import parse_qs as _pq
+                n = max(1, min(50, int(_pq(urlparse(self.path).query).get("n", ["20"])[0])))
+            except Exception:
+                n = 20
+            d, m = STATE["data"], STATE["model"]
+            proba = m.p_dropout(d.X)
+            order = _np.argsort(-proba)[:n]
+            items = []
+            for rid in order:
+                rid = int(rid)
+                try:
+                    cf = STATE["agent"].counterfactual(rid) if hasattr(STATE["agent"], "counterfactual") else None
+                except Exception:
+                    cf = None
+                items.append({"row_id": rid, "course": d.rows[rid].get("Course"),
+                              "p_dropout": round(float(proba[rid]), 4),
+                              "risk_level": "高" if proba[rid] >= 0.6 else "中" if proba[rid] >= 0.3 else "低",
+                              "suggest": (cf or {}).get("feature") if isinstance(cf, dict) else None})
+            return self._json({"n": len(items), "items": items,
+                               "note": "按预测风险降序；供辅导员排面谈优先级，不作处分依据"})
+
         if path == "/api/kb":
             from kb import KB, summary as kb_summary
             return self._json({"summary": kb_summary(), "entries": KB})
@@ -170,21 +247,32 @@ class Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             return self._json({"error": "invalid content length"}, 400)
         if length < 0 or length > MAX_BODY:
-            return self._json({"error": "content length out of range"}, 413)
+            # 先丢弃（有上限）再回包，否则客户端会看到连接被重置
+            try:
+                self.rfile.read(min(length, 4 * MAX_BODY))
+            except Exception:
+                pass
+            return self._json({"error": f"payload too large: {length} bytes > {MAX_BODY}"}, 413,
+                              extra=[("Connection", "close")])
         raw = self.rfile.read(length).decode("utf-8", errors="replace") if length else ""
         if path == "/api/login":
+            if self._login_limited():
+                return self._json({"error": "too many attempts, retry in 60s"}, 429)
             f = parse_qs(raw)
             if f.get("account", [""])[0] == ACCOUNT and f.get("password", [""])[0] == PASSWORD:
                 sid = secrets.token_hex(16)
-                SESSIONS.add(sid)
-                return self._send(302, "", extra=[("Location", "/"),
-                                                  ("Set-Cookie", f"sid={sid}; Path=/; HttpOnly")])
+                SESSIONS[sid] = time.time() + SESSION_TTL
+                https = (self.headers.get("X-Forwarded-Proto", "").lower() == "https")
+                cookie = f"sid={sid}; Path=/; HttpOnly; SameSite=Lax"
+                if COOKIE_SECURE or https:
+                    cookie += "; Secure"
+                return self._send(302, "", extra=[("Location", "/"), ("Set-Cookie", cookie)])
             return self._send(200, LOGIN_HTML.replace('<div class="e" id="e"></div>',
                                                      '<div class="e" id="e">账号或密码不正确</div>'))
         if path == "/api/logout":
             s = self._sid()
             if s:
-                SESSIONS.discard(s)
+                SESSIONS.pop(s, None)
             return self._json({"ok": True})
         if not self._authed():
             return self._json({"error": "unauthorized"}, 401)
@@ -196,19 +284,29 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 return self._json({"error": "payload must be an object"}, 400)
             q = payload.get("question", "")
-            if not isinstance(q, str) or not q.strip() or len(q) > 400:
-                return self._json({"error": "invalid question"}, 400)
+            if not isinstance(q, str) or not q.strip():
+                return self._json({"error": "question 不能为空"}, 400)
+            if len(q) > 400:
+                return self._json({"error": f"question 过长：{len(q)} 字，上限 400"}, 400)
             try:
                 rid = int(payload.get("row_id", STATE["data"].test_idx[0]))
             except (TypeError, ValueError):
                 return self._json({"error": "invalid row_id"}, 400)
             if not 0 <= rid < len(STATE["data"].rows):
-                return self._json({"error": "row_id out of range"}, 400)
+                return self._json({"error": f"row_id 超出范围：应为 0–{len(STATE['data'].rows)-1}"}, 400)
             try:
                 if not STATE.get("ready"):
                     return self._json({"status": "loading",
                                        "detail": "模型加载中，请稍候"}, 503)
-                return self._json(STATE["agent"].run(rid, q.strip()))
+                key = (rid, q.strip())
+                hit = RESULT_CACHE.get(key)
+                if hit is not None:
+                    return self._json({**hit, "cached": True})
+                res = STATE["agent"].run(rid, q.strip())
+                if len(RESULT_CACHE) >= CACHE_MAX:
+                    RESULT_CACHE.pop(next(iter(RESULT_CACHE)), None)
+                RESULT_CACHE[key] = res
+                return self._json(res)
             except Exception as exc:
                 return self._json({"error": "execution failed",
                                    "detail": type(exc).__name__}, 500)
@@ -230,7 +328,35 @@ def init_state(data, model, agent):
 
 def serve(port: int = 8767, host: str = "127.0.0.1", warmup=None):
     """先占用端口再预热模型：云平台健康检查可在训练完成前通过。"""
-    httpd = ThreadingHTTPServer((host, port), Handler)
+    class CappedServer(ThreadingHTTPServer):
+        """限制并发处理线程数，避免被打满导致 OOM。"""
+        max_concurrent = int(os.environ.get("MAX_CONCURRENCY", "16"))
+        _sem = None
+
+        def process_request(self, request, client_address):
+            import threading as _th
+            if CappedServer._sem is None:
+                CappedServer._sem = _th.BoundedSemaphore(CappedServer.max_concurrent)
+            if not CappedServer._sem.acquire(timeout=30):
+                try:
+                    request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                except Exception:
+                    pass
+                self.shutdown_request(request)
+                return
+            try:
+                super().process_request(request, client_address)
+            except Exception:
+                CappedServer._sem.release()
+                raise
+
+        def process_request_thread(self, request, client_address):
+            try:
+                super().process_request_thread(request, client_address)
+            finally:
+                CappedServer._sem.release()
+
+    httpd = CappedServer((host, port), Handler)
     print(f"[learn] http://{host}:{port}  account={ACCOUNT} password={PASSWORD}", flush=True)
     if host == "0.0.0.0":
         print("[learn] 注意：已绑定全部网卡，仅建议在受信任网络或反向代理后使用", flush=True)
