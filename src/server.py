@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -133,7 +134,8 @@ class Handler(BaseHTTPRequestHandler):
                                "rows": len(STATE["data"].rows) if (ready and STATE.get("data")) else 0})
         if path == "/":
             q = parse_qs(urlparse(self.path).query)
-            if q.get("demo") and self.client_address[0] in ("127.0.0.1", "::1"):
+            if (q.get("demo") and os.environ.get("DEMO_LOCAL") == "1"
+                    and self.client_address[0] in ("127.0.0.1", "::1")):
                 sid = secrets.token_hex(16)
                 SESSIONS.add(sid)
                 return self._send(302, "", extra=[("Location", "/?auto=1"),
